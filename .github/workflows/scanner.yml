@@ -2,7 +2,7 @@ name: scanner
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # relevo cada 6h; cada job corre 5h45 seguidas
+    - cron: "*/20 * * * *"   # cada 20 min (GitHub suele demorar unos minutos más)
   workflow_dispatch:
 
 concurrency:
@@ -12,12 +12,20 @@ concurrency:
 jobs:
   vigilar:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - name: vigilar
+
+      # estado.json recuerda a qué tokens ya te avisó, para no repetir cada 20 min
+      - uses: actions/cache@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: buscar
         env:
           SMART_JSON: ${{ secrets.SMART_JSON }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: timeout 20700 python3 scanner.py || true
+        run: python3 scanner.py --once

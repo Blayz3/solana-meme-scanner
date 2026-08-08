@@ -38,7 +38,12 @@ F = dict(
     rank_pnl_min=10_000,       # $ — y ganó plata real. Corta el polvo con ROI de 1.000.000%
     rank_roi_max=1_000_000,    # % — techo de cordura: 10.000x no lo hace un humano, es dato roto
     rank_pnl_max=50_000_000,   # $ — idem, arriba de esto es un router/pool mal etiquetado
-    rank_min_tokens=2,         # una wallet entra al top solo si acertó en >=2 de esos
+    rank_x100=10_000,          # % — tiene que haber roto un x100 al menos una vez
+    rank_x20=2_000,            # % — y los x20 tienen que ser constantes:
+    rank_x20_veces=2,          #     al menos 2 tokens distintos arriba de x20
+    rank_rondas=2,             # rondas de bola de nieve: en qué más ganaron los que califican
+    pos_min=20,                # posiciones históricas: menos que esto es suerte, no historial
+    pos_max=5_000,             # y más que esto es una granja de bots (vimos una con 182.463)
     bundle_max_overlap=0.5,  # si dos ganadores comparten >50% de holders, es el mismo grupo
 )
 POLL = 20  # segundos entre ciclos
@@ -249,45 +254,102 @@ def merece(fila):
                 and F["rank_pnl_min"] <= pnl <= F["rank_pnl_max"])
 
 
-def rankear():
-    """Los top_n traders que entraron abajo en tokens que ya hicieron el recorrido grande."""
-    st("/v2/pnl/leaderboard/top", days=1, limit=1)  # falla acá y no después de escanear
-    d = cargar(SMART, {"wallets": {}, "creditados": [], "sets": {}})
-    grandes = tokens_grandes()
-    print(f"{len(grandes)} tokens arriba de ${F['rank_mcap_min']:,} para analizar "
-          f"(~{len(grandes) * 1.2 / 60:.0f} min a 1 req/s)")
+def constante(v):
+    """El trader que buscás: rompió un x100 alguna vez Y sus x20 se repiten.
+    Un solo pelotazo es suerte; el que repite x20 tiene método."""
+    x = v.get("x") or []
+    return max(x, default=0) >= F["rank_x100"] and sum(1 for r in x if r >= F["rank_x20"]) >= F["rank_x20_veces"]
 
-    puntos = d.setdefault("rank", {})          # se acumula entre corridas
-    hechos = set(d.setdefault("rank_hechos", []))
-    nuevos = [(m, p) for m, p in grandes if m not in hechos]
-    print(f"{len(nuevos)} sin analizar todavía (de {len(grandes)})")
 
-    for i, (mint, par) in enumerate(nuevos, 1):
-        sym = par["baseToken"]["symbol"]
-        buenos = [f for f in filas(st(f"/v2/pnl/tokens/{mint}/traders",
-                                      sort="pnl", direction="desc", limit=200)) if merece(f)]
-        hechos.add(mint)
-        for f in buenos:
-            e = puntos.setdefault(wallet_de(f), {"pnl": 0.0, "roi": 0, "tokens": []})
-            e["pnl"] += ganancia(f)
-            e["roi"] = max(e["roi"], round(f.get("roi") or 0))
-            e["tokens"] = (e["tokens"] + [sym])[-20:]
-        print(f"  [{i}/{len(nuevos)}] {sym}: {len(buenos)} entraron abajo y ganaron")
+def analizar(mint):
+    """(símbolo, traders que entraron abajo y ganaron) de un token."""
+    d = st(f"/v2/pnl/tokens/{mint}/traders", sort="pnl", direction="desc", limit=200)
+    sym = ((d or {}).get("meta") or {}).get("symbol") or mint[:6]
+    return sym, [f for f in filas(d) if merece(f)]
 
-    top = sorted(({**v, "w": w} for w, v in puntos.items() if len(v["tokens"]) >= F["rank_min_tokens"]),
-                 key=lambda x: -x["roi"])[:F["top_n"]]   # el que más multiplicó, no el que más plata movió
-    d["rank_hechos"] = sorted(hechos)[-1000:]
-    for w in list(d["wallets"]):                       # el top se recalcula entero cada vez
+
+def expandir(puntos, hechos):
+    """Los tokens donde los que YA califican también ganaron. Ahí hay más como ellos."""
+    nuevos = set()
+    for w in [w for w, v in puntos.items() if constante(v)][:40]:
+        d = st(f"/v2/pnl/wallets/{w}/positions", limit=100, sort="pnl", direction="desc")
+        for pos in filas(d):
+            mint = pos.get("token")
+            if isinstance(mint, str) and mint not in hechos and (pos.get("roi") or 0) >= F["rank_x20"]:
+                nuevos.add(mint)
+    return sorted(nuevos)
+
+
+def posiciones(w):
+    """Cuántos tokens distintos operó en su vida. Un humano: decenas o cientos.
+    182.463 es una granja que compra todo — imposible de seguir y ensucia la señal."""
+    d = st(f"/v2/pnl/wallets/{w}/positions", limit=1)
+    return ((d or {}).get("stats") or {}).get("total")
+
+
+def elegir(puntos):
+    """Los top_n que califican Y son wallets de persona, verificando una por una."""
+    top = []
+    for v in sorted(({**v, "w": w} for w, v in puntos.items() if constante(v)), key=lambda x: -x["roi"]):
+        if len(top) >= F["top_n"]:
+            break
+        n = posiciones(v["w"])
+        if n is None or not (F["pos_min"] <= n <= F["pos_max"]):
+            print(f"  x {v['w'][:8]}..: {n} posiciones — fuera")
+            continue
+        top.append({**v, "pos": n})
+    return top
+
+
+def guardar_top(d, top):
+    for w in list(d["wallets"]):                       # el top se recalcula entero
         if not d["wallets"][w].get("mio") and d["wallets"][w].get("pnl"):
             del d["wallets"][w]
     for v in top:
         e = d["wallets"].setdefault(v["w"], {"wins": 0, "tokens": []})
-        e.update(pnl=round(v["pnl"]), roi=v["roi"], tokens=v["tokens"][-20:],
+        e.update(pnl=round(v["pnl"]), roi=v["roi"], x=v["x"], pos=v["pos"], tokens=v["tokens"][-20:],
                  wins=max(e["wins"], len(v["tokens"])))
     SMART.write_text(json.dumps(d, indent=1))
-    print(f"\ntop {len(top)} traders vigilados — {len(puntos)} candidatos de {len(hechos)} tokens grandes")
+    print(f"\ntop {len(top)} traders")
     for v in top:
-        print(f"  {v['roi'] / 100:>8,.0f}x  ${v['pnl']:>12,.0f}  {len(v['tokens'])} tokens  {v['w']}")
+        xs = " ".join(f"{r / 100:.0f}x" for r in sorted(v["x"], reverse=True)[:5])
+        print(f"  ${v['pnl']:>11,.0f}  {v['pos']:>5} pos  [{xs}]  {v['w']}")
+
+
+def reelegir():
+    """Rehacer la selección con lo ya analizado, sin volver a gastar en tokens."""
+    d = cargar(SMART, {"wallets": {}})
+    guardar_top(d, elegir(d.get("rank") or {}))
+
+
+def rankear():
+    """Los top_n traders que rompieron un x100 y repiten x20."""
+    st("/v2/pnl/leaderboard/top", days=1, limit=1)  # falla acá y no después de escanear
+    d = cargar(SMART, {"wallets": {}, "creditados": [], "sets": {}})
+    puntos = d.setdefault("rank", {})          # se acumula entre corridas
+    hechos = set(d.setdefault("rank_hechos", []))
+    cola = [m for m, _ in tokens_grandes() if m not in hechos]
+
+    for ronda in range(F["rank_rondas"] + 1):
+        print(f"\n--- ronda {ronda}: {len(cola)} tokens ---" if ronda else f"{len(cola)} tokens para analizar")
+        for i, mint in enumerate(cola, 1):
+            sym, buenos = analizar(mint)
+            hechos.add(mint)
+            for f in buenos:
+                e = puntos.setdefault(wallet_de(f), {"pnl": 0.0, "roi": 0, "tokens": [], "x": []})
+                e["pnl"] += ganancia(f)
+                e["roi"] = max(e["roi"], round(f.get("roi") or 0))
+                e["tokens"] = (e["tokens"] + [sym])[-20:]
+                e["x"] = (e["x"] + [round(f.get("roi") or 0)])[-20:]
+            if i % 10 == 0 or i == len(cola):
+                print(f"  {i}/{len(cola)} — {sum(1 for v in puntos.values() if constante(v))} califican", flush=True)
+        if ronda == F["rank_rondas"]:
+            break
+        cola = expandir(puntos, hechos)
+
+    d["rank_hechos"] = sorted(hechos)[-5000:]
+    print(f"\n{len(puntos)} candidatos de {len(hechos)} tokens — verificando cuáles son personas")
+    guardar_top(d, elegir(puntos))
 
 
 def vigiladas(todas=None):
@@ -308,9 +370,9 @@ def bundle(duenos, sets):
 
 def smart_dentro(rep, wallets):
     """Smart wallets presentes en el top 20 de holders, ordenadas por aciertos."""
-    dentro = [(h["owner"], h["pct"], wallets[h["owner"]]["wins"])
+    dentro = [(h["owner"], h["pct"], wallets[h["owner"]].get("roi") or 0)
               for h in holders_reales(rep) if h["owner"] in wallets]
-    return sorted(dentro, key=lambda x: -x[2])
+    return sorted(dentro, key=lambda x: -x[2])   # el de mayor múltiplo primero
 
 
 def resumen(rep, par, smart):
@@ -328,7 +390,8 @@ def resumen(rep, par, smart):
         f"{sum(h['pct'] for h in hs[:10]):.0f}% | insiders {len(ins)} ({sum(h['pct'] for h in ins):.1f}%)",
         "smart money:",
     ]
-    lineas += [f"  {w[:4]}..{w[-4:]}  {pct:.2f}%  ({wins} aciertos)" for w, pct, wins in smart[:6]]
+    lineas += [f"  {w[:4]}..{w[-4:]}  {pct:.2f}% del supply" + (f"  (max {roi / 100:.0f}x)" if roi else "  (tuya)")
+               for w, pct, roi in smart[:6]]
     lineas += [par["url"], rep["mint"]]
     return "\n".join(lineas)
 
@@ -459,7 +522,8 @@ def test():
     par = {"baseToken": {"symbol": "T"}, "url": "u", "pairCreatedAt": (time.time() - 7200) * 1000,
            "liquidity": {"usd": 60_000}, "volume": {"h24": 300_000}, "marketCap": 800_000,
            "priceChange": {"h1": 5, "h6": 40, "h24": 120}}
-    wallets = {"W0": {"wins": 3}, "W1": {"wins": 2}, "W3": {"wins": 5}, "AMM1": {"wins": 9}}
+    wallets = {"W0": {"wins": 3, "roi": 30_000}, "W1": {"wins": 2}, "W3": {"wins": 5, "roi": 90_000},
+               "AMM1": {"wins": 9, "roi": 99_999}}
 
     assert anti_rug(rep, par) == [], anti_rug(rep, par)
     s = smart_dentro(rep, wallets)
@@ -496,6 +560,11 @@ def test():
     assert not merece({"wallet": "W", "roi": 185_584_295_978, "pnl": {"token": {"total": 0}}}), "acepta polvo"
     assert not merece({"wallet": "W", "roi": 482_271_612, "pnl": {"token": {"total": 186_875_666_373}}}), \
         "acepta el artefacto de $186.000M"
+    # x100 alguna vez + x20 constantes
+    assert constante({"x": [81_850, 3_100]}), "rechaza al bueno (818x + 31x)"
+    assert not constante({"x": [81_850, 400]}), "un solo x20: no es constante"
+    assert not constante({"x": [3_100, 2_400, 2_100]}), "muchos x20 pero nunca rompió el x100"
+    assert not constante({"x": []}) and not constante({})
     assert filas({"firstBuyers": [{"address": "X"}]})[0]["address"] == "X"   # otro nombre de lista
     assert filas(None) == [] and wallet_de({}) is None
     todas = {f"R{i}": {"wins": 2, "tokens": [], "pnl": i * 1000} for i in range(50)}
@@ -520,6 +589,8 @@ if __name__ == "__main__":
         bootstrap()
     elif "--rank" in a:
         rankear()
+    elif "--reelegir" in a:
+        reelegir()
     elif "--add" in a:
         agregar(a[a.index("--add") + 1:])
     elif "--export" in a:
