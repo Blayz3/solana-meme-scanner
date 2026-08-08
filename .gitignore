@@ -1,0 +1,5 @@
+# tu lista de wallets no va al repo: viaja como secret SMART_JSON
+smart.json
+estado.json
+*.log
+__pycache__/
