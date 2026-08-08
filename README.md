@@ -11,20 +11,23 @@ python3 scanner.py               # vigilar (loop)
 python3 scanner.py --test        # self-check
 ```
 
-## 1. La key (2 min, gratis)
+## 1. El bot de Telegram
 
-Sacá una en [solanatracker.io/data-api](https://www.solanatracker.io/data-api) —
-plan Free, sin tarjeta, 1 request/segundo.
+1. Abrí [@BotFather](https://t.me/BotFather) en Telegram y mandá `/newbot`.
+2. Le ponés nombre y usuario (tiene que terminar en `bot`). Te devuelve un token
+   tipo `8123456789:AAH...`.
+3. **Escribile algo a tu bot** — Telegram no deja que te hable primero.
+4. Sacá tu chat id abriendo esta URL en el navegador, con tu token:
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` → buscá `"chat":{"id":123456789`.
 
 ```bash
-export SOLANATRACKER_KEY=...
-export TELEGRAM_TOKEN=...  TELEGRAM_CHAT_ID=...
+gh secret set TELEGRAM_TOKEN --body "8123456789:AAH..."
+gh secret set TELEGRAM_CHAT_ID --body "123456789"
 ```
 
-El chat id lo sacás escribiéndole a tu bot y abriendo
-`https://api.telegram.org/bot<TOKEN>/getUpdates`.
+Para probarlo local: `export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...`
 
-## 2. Los 30 mejores traders
+## 2. Los 30 traders (análisis único, ya hecho)
 
 ```bash
 python3 scanner.py --rank
@@ -50,13 +53,16 @@ lista crece y mejora sola.
 Descarta lo que Solana Tracker marca como `bot`, `pool`, `developer`, `exchange`,
 `hacker`, `spam_dusting` y `arbitrage` — esos ganan por infraestructura, no por criterio.
 
-Volvé a correrlo cada tanto; en Actions ya corre solo una vez por día. Hoy quedaron
-17 traders — el umbral de ≥2 tokens es exigente y hay ~38 tokens grandes por corrida;
-llega a 30 en unos días de cron.
+**Esto ya se corrió y la lista está congelada**: 30 traders, de 8.185x a 10x, sacados
+de 1.683 candidatos en 70 tokens grandes. El bot NO reanaliza: solo vigila. Si algún
+día querés refrescarla, corré `--rank` a mano y volvé a subir el secret (paso 5).
+
+Necesita `SOLANATRACKER_KEY` (gratis en [solanatracker.io/data-api](https://www.solanatracker.io/data-api)),
+solo para este paso — el bot vigilando no la usa.
 
 ## 3. Tus wallets
 
-Van aparte del top 30: **nunca se caen de la lista**, sin importar el ranking.
+Van aparte de los 30: **nunca se caen de la lista**.
 
 ```bash
 python3 scanner.py --add 62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV
@@ -66,6 +72,9 @@ python3 scanner.py --add mis-traders.txt
 Acepta direcciones sueltas, un `.txt` (una por línea, `#` para comentar), y URLs
 pegadas del navegador (gmgn, solscan, axiom, birdeye). Para sacar una, borrala de
 `smart.json`.
+
+**Después de agregar wallets hay que resubir el secret** (paso 5), si no Actions
+sigue con la lista vieja.
 
 ## 4. Vigilar
 
@@ -84,28 +93,29 @@ Todo se ajusta en el dict `F` arriba de `scanner.py`.
 
 ## 5. 24/7 en GitHub Actions
 
-El workflow ya está en `.github/workflows/scanner.yml`. Necesita **repo público**
-(los privados tienen 2000 min/mes, no alcanza ni para un día). Corre un job de
-5h45 y se releva cada 6h, así que el poll sigue siendo de 30s, no de 5 minutos.
+Ya está corriendo en un repo público (los privados dan 2000 min/mes, no alcanza).
+`.github/workflows/scanner.yml` levanta un job de 5h45 y se releva cada 6h, así que
+el poll sigue siendo de 30s y no los 5 minutos del cron de Actions.
 
-**Tu lista de wallets no va al repo.** Se guarda en un gist privado:
+**Tu lista de wallets no está en el repo** — `smart.json` está en `.gitignore` y viaja
+como secret cifrado:
 
 ```bash
-gh gist create smart.json --desc "scanner state"        # anotá el id que imprime
-gh secret set GIST_ID --body "<id>"
-gh secret set GH_TOKEN --body "<token con scope gist>"
-gh secret set SOLANATRACKER_KEY --body "$SOLANATRACKER_KEY"
-gh secret set TELEGRAM_TOKEN --body "$TELEGRAM_TOKEN"
-gh secret set TELEGRAM_CHAT_ID --body "$TELEGRAM_CHAT_ID"
+python3 scanner.py --export | gh secret set SMART_JSON
 ```
 
-Sin `GIST_ID` el bot funciona igual, pero en Actions arranca de cero cada relevo.
+Correlo cada vez que agregues wallets o refresques el ranking. Para arrancar ya sin
+esperar al cron:
 
-**Dos cosas antes de subirlo:** el uso aceptable de GitHub Actions pide que los
-minutos sean para el proyecto de software, no para correr un servicio propio 24/7;
-un bot de cripto permanente es justo el caso que suelen marcar, y la cuenta es tuya.
-Y aunque las wallets queden en el gist, el repo público muestra tus filtros y tu
-estrategia. Un VPS de $5 evita las dos cosas.
+```bash
+gh workflow run scanner.yml
+gh run watch
+```
+
+**Antes de dejarlo así:** el uso aceptable de GitHub Actions pide que los minutos sean
+para el proyecto de software, no para correr un servicio propio 24/7; un bot de cripto
+permanente es justo el caso que suelen marcar, y la cuenta es tuya. Además el repo
+público muestra tus filtros y tu estrategia (las wallets no). Un VPS de $5 evita las dos.
 
 Alternativa local, sin GitHub:
 
@@ -121,4 +131,6 @@ nohup python3 scanner.py >> scanner.log 2>&1 &
   token de $3M no aparece en el snapshot.
 - **30 wallets es una red angosta**: que 3 de ellas coincidan en el mismo token
   chico pasa pocas veces por semana. Es alta precisión, no volumen. Si querés más
-  señales, subí `top_n` a 100 o bajá `min_smart` a 2.
+  señales, bajá `min_smart` a 2 o corré `--rank` con `rank_min_tokens=2` y `top_n=100`.
+- **La lista envejece**: un trader que la rompió en 2025 puede estar retirado. Refrescá
+  el ranking cada par de meses.

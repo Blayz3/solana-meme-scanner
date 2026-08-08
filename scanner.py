@@ -7,6 +7,7 @@
   python3 scanner.py --once
   python3 scanner.py --add WALLET [WALLET...]   # cargar tus traders (o un .txt, o URLs)
   python3 scanner.py --wallets     # ver la lista de smart money
+  python3 scanner.py --export      # la lista sola, para el secret SMART_JSON
   python3 scanner.py --test
 
 Datos: DexScreener (precio/liq/vol) + RugCheck (holders, insiders, authorities, LP).
@@ -435,6 +436,12 @@ def agregar(entradas):
     print(f"+{nuevas} — tenés {sum(1 for v in d['wallets'].values() if v.get('mio'))} wallets propias cargadas")
 
 
+def exportar():
+    """Solo las wallets vigiladas, para el secret SMART_JSON (el análisis queda local)."""
+    w, _ = vigiladas()
+    print(json.dumps({"wallets": w}, indent=1))
+
+
 def listar():
     wallets = cargar(SMART, {"wallets": {}})["wallets"]
     for w, v in sorted(wallets.items(), key=lambda x: (-x[1].get("mio", False), -x[1]["wins"]))[:60]:
@@ -515,6 +522,8 @@ if __name__ == "__main__":
         rankear()
     elif "--add" in a:
         agregar(a[a.index("--add") + 1:])
+    elif "--export" in a:
+        exportar()
     elif "--wallets" in a:
         listar()
     else:
