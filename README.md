@@ -1,10 +1,14 @@
 # solana-meme-scanner
 
 Te avisa por Telegram cuando **≥3 de los 30 mejores traders** entran a un token
-limpio con mcap entre **$120k y $5M**.
+limpio con mcap entre **$120k y $5M**. Busca cada **20 minutos**.
+
+El único criterio del token es ese: que estén 3 o más adentro y que no sea rug.
+Lo exigente es quién entra en la lista de traders.
 
 ```bash
-python3 scanner.py --rank        # traer los 30 mejores traders (necesita key)
+python3 scanner.py --rank        # rearmar los 30 traders (necesita key, ~25 min)
+python3 scanner.py --reelegir    # rehacer la selección sin reanalizar tokens
 python3 scanner.py --add WALLET  # sumar los tuyos (o un .txt, o URLs)
 python3 scanner.py --wallets     # ver a quién vigila
 python3 scanner.py               # vigilar (loop)
@@ -29,36 +33,28 @@ Para probarlo local: `export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...`
 
 ## 2. Los 30 traders (análisis único, ya hecho)
 
-```bash
-python3 scanner.py --rank
-```
+Un trader entra a la lista solo si cumple las tres cosas:
 
-Busca los tokens que **ya hicieron el recorrido** (mcap ≥$10M hoy) y le pide a Solana
-Tracker todos sus traders. Una wallet puntúa solo si en ese token cumple las dos cosas:
+1. **Rompió un x100** alguna vez — al menos un token con ROI ≥10.000%.
+2. **Sus x20 se repiten** — ≥2 tokens distintos arriba de x20. Un pelotazo es suerte;
+   repetir es método.
+3. **Es una persona** — entre 20 y 5.000 posiciones históricas. Hay wallets con
+   **182.463 tokens operados**: son granjas que compran todo, cumplen el x100 de casualidad
+   y son imposibles de seguir. Se filtraron nueve, de 7.000 a 42.000 posiciones.
 
-- **ROI ≥500%** — entró abajo de verdad. Ordenar por ganancia trae ballenas que
-  movieron $6M para sacar 20%: esos no te sirven, entran arriba.
-- **ganancia ≥$10.000** — y no es polvo. Ordenar por ROI trae wallets con
-  185.000.000.000% sobre tres centavos.
+Y por token, para que ese acierto cuente: ROI ≥500% con ganancia ≥$10.000 — abajo de eso
+es polvo, arriba de un techo (ROI ≤1.000.000%, ≤$50M) es un router mal etiquetado.
+Sin ese techo el ranking lo encabezaba una wallet con $186.000 millones.
 
-Hay techo además (ROI ≤1.000.000%, ganancia ≤$50M por token): arriba de eso no hay
-humano, hay un router mal etiquetado. Sin ese corte el ranking lo encabezaba una
-wallet con $186.000 millones.
+**Cómo los busca.** Arranca por los tokens que ya hicieron el recorrido (mcap ≥$5M hoy) y
+después va en **bola de nieve**: a los que califican les mira en qué otros tokens ganaron,
+analiza esos, y repite. Así llegó a **776 tokens y 9.099 candidatos** — las listas de
+trending sueltas dan 45 tokens y se agotan enseguida.
 
-Suma la ganancia de cada token donde lo logró, tiene que aparecer en **≥2 tokens
-distintos** (uno es suerte) y quedan los **30 con más ganancia**. Los resultados se
-**acumulan entre corridas**: cada vez analiza solo los tokens nuevos, así que la
-lista crece y mejora sola.
-
-Descarta lo que Solana Tracker marca como `bot`, `pool`, `developer`, `exchange`,
-`hacker`, `spam_dusting` y `arbitrage` — esos ganan por infraestructura, no por criterio.
-
-**Esto ya se corrió y la lista está congelada**: 30 traders, de 8.185x a 10x, sacados
-de 1.683 candidatos en 70 tokens grandes. El bot NO reanaliza: solo vigila. Si algún
-día querés refrescarla, corré `--rank` a mano y volvé a subir el secret (paso 5).
-
-Necesita `SOLANATRACKER_KEY` (gratis en [solanatracker.io/data-api](https://www.solanatracker.io/data-api)),
-solo para este paso — el bot vigilando no la usa.
+**La lista está congelada**: el bot NO reanaliza, solo vigila. Para refrescarla algún día,
+`--rank` (~25 min, necesita `SOLANATRACKER_KEY` gratis de
+[solanatracker.io/data-api](https://www.solanatracker.io/data-api)) y resubir el secret.
+`--reelegir` rehace solo la selección con lo ya analizado, en un minuto.
 
 ## 3. Tus wallets
 
@@ -78,10 +74,10 @@ sigue con la lista vieja.
 
 ## 4. Vigilar
 
-Cada ciclo (~60s) junta ~200 tokens de DexScreener + GeckoTerminal, se queda con los
-de tu rango y les pide el reporte de RugCheck. Manda alerta a Telegram si hay
-**≥3 wallets vigiladas** en el top-20 de holders **y** pasa todo el anti-rug.
-Vuelve a avisar si la cuenta sube (3 → 5).
+Cada corrida junta ~200 tokens de DexScreener + GeckoTerminal, se queda con los de tu
+rango y les pide el reporte de RugCheck. Manda alerta a Telegram si hay **≥3 wallets
+vigiladas** en el top-20 de holders **y** pasa todo el anti-rug. Vuelve a avisar si la
+cuenta sube (3 → 5). Una corrida tarda ~25 segundos.
 
 ### Anti-rug (todo tiene que dar OK)
 
@@ -93,9 +89,9 @@ Todo se ajusta en el dict `F` arriba de `scanner.py`.
 
 ## 5. 24/7 en GitHub Actions
 
-Ya está corriendo en un repo público (los privados dan 2000 min/mes, no alcanza).
-`.github/workflows/scanner.yml` levanta un job de 5h45 y se releva cada 6h, así que
-el poll sigue siendo de 30s y no los 5 minutos del cron de Actions.
+Ya está corriendo: `.github/workflows/scanner.yml` busca **cada 20 minutos** (GitHub
+suele demorar unos minutos más). `estado.json` viaja por el cache de Actions para no
+repetirte el mismo token en cada corrida.
 
 **Tu lista de wallets no está en el repo** — `smart.json` está en `.gitignore` y viaja
 como secret cifrado:
@@ -133,4 +129,6 @@ nohup python3 scanner.py >> scanner.log 2>&1 &
   chico pasa pocas veces por semana. Es alta precisión, no volumen. Si querés más
   señales, bajá `min_smart` a 2 o corré `--rank` con `rank_min_tokens=2` y `top_n=100`.
 - **La lista envejece**: un trader que la rompió en 2025 puede estar retirado. Refrescá
-  el ranking cada par de meses.
+  el ranking cada par de meses con `--rank`.
+- **Cada 20 min, no al instante**: si tres de ellos entran justo después de una corrida,
+  te enterás hasta 20 minutos después.
