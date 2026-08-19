@@ -19,6 +19,8 @@ from pathlib import Path
 F = dict(
     # rango de compra
     mcap_min=120_000, mcap_max=5_000_000,
+    mcap_min_nueva=30_000,  # recién salidas: piso más bajo, el x10 está acá
+    edad_nueva_h=24,        # hasta qué edad un par cuenta como "recién salido"
     liq_min=15_000,
     # gatillo de alerta
     min_smart=3,          # smart wallets dentro del top 20 de holders
@@ -47,6 +49,8 @@ F = dict(
     bundle_max_overlap=0.5,  # si dos ganadores comparten >50% de holders, es el mismo grupo
 )
 POLL = 20  # segundos entre ciclos
+HITOS = (2, 5, 10)          # múltiplos que se avisan desde el mcap de la alerta
+VENTANA = 21 * 86400        # después de esto se deja de seguir el token
 
 DIR = Path(__file__).parent
 SMART = DIR / "smart.json"      # {"wallets": {addr: {"wins": n, "tokens": []}}, "creditados": []}
@@ -122,6 +126,20 @@ def tokens_grandes():
                 vistos[tok["mint"]] = {"baseToken": {"symbol": sym, "address": tok["mint"]},
                                        "marketCap": mcap}
     return sorted(vistos.items(), key=lambda x: -x[1]["marketCap"])
+
+
+def edad_h(par):
+    """Horas desde que se creó el par (0 si DexScreener no lo dice)."""
+    ts = par.get("pairCreatedAt") or 0
+    return (time.time() * 1000 - ts) / 3.6e6 if ts else 0
+
+
+def en_rango(par):
+    """Rango de compra. Las de <24h entran desde $30k: un x10 desde $2M pide $20M,
+    desde $50k pide $500k. Abajo el x10 es frecuente, por eso el anti-rug es el mismo."""
+    mcap = par.get("marketCap") or par.get("fdv") or 0
+    piso = F["mcap_min_nueva"] if 0 < edad_h(par) <= F["edad_nueva_h"] else F["mcap_min"]
+    return piso <= mcap <= F["mcap_max"] and liq(par) >= F["liq_min"]
 
 
 def liq(par):
@@ -381,9 +399,10 @@ def resumen(rep, par, smart):
     vol24 = (par.get("volume") or {}).get("h24") or 0
     mcap = par.get("marketCap") or par.get("fdv") or 0
     ch = par.get("priceChange") or {}
-    edad = (time.time() * 1000 - (par.get("pairCreatedAt") or 0)) / 3.6e6
+    edad = edad_h(par)
     lineas = [
-        f"🐋 {par['baseToken']['symbol']} — {len(smart)} smart wallets adentro",
+        f"{'🆕' if 0 < edad < F['edad_nueva_h'] else '🐋'} {par['baseToken']['symbol']} — "
+        f"{len(smart)} smart wallets adentro",
         f"mcap ${mcap:,.0f} | liq ${liq(par):,.0f} | vol24 ${vol24:,.0f} | edad {edad:.1f}h",
         f"1h {ch.get('h1', 0):+.0f}% | 6h {ch.get('h6', 0):+.0f}% | 24h {ch.get('h24', 0):+.0f}%",
         f"holders {rep.get('totalHolders', '?')} | top1 {hs[0]['pct']:.1f}% | top10 "
@@ -407,30 +426,79 @@ def telegram(msg):
         print(f"  ! telegram: {e}", file=sys.stderr)
 
 
+# --- seguimiento de lo alertado --------------------------------------------
+def n_de(estado, mint):
+    """Cuántas smart wallets se avisaron ya (estado viejo guardaba el int pelado)."""
+    v = estado.get(mint)
+    return v["n"] if isinstance(v, dict) else (v or 0)
+
+
+def avanzar(v, mcap):
+    """Múltiplo desde la alerta y el hito recién cruzado, si cruzó alguno."""
+    x = mcap / v["mcap0"] if v.get("mcap0") else 0
+    if x <= v["x"]:
+        return v["x"], None
+    return round(x, 2), max((h for h in HITOS if x >= h > v["hito"]), default=None)
+
+
+def seguir(estado):
+    """Precio de lo ya alertado: avisa cada hito y guarda el máximo. Sin esto no hay
+    forma de saber si el gatillo encuentra x10 o solo encuentra ruido."""
+    vivos = [m for m, v in estado.items() if isinstance(v, dict)
+             and v["hito"] < HITOS[-1] and time.time() - v["t"] < VENTANA]
+    for mint, par in pares(vivos).items():
+        v, mcap = estado[mint], par.get("marketCap") or par.get("fdv") or 0
+        v["x"], hito = avanzar(v, mcap)
+        if hito:
+            v["hito"] = hito
+            telegram(f"\U0001F680 {par['baseToken']['symbol']} x{v['x']:.1f} desde la alerta "
+                     f"(${v['mcap0']:,.0f} -> ${mcap:,.0f})\n{par['url']}")
+
+
+def stats():
+    d = [v for v in cargar(ESTADO, {}).values() if isinstance(v, dict)]
+    if not d:
+        return print("todavía no hay alertas con seguimiento")
+    print(f"{len(d)} alertas seguidas")
+    for h in HITOS:
+        n = sum(1 for v in d if v["x"] >= h)
+        print(f"  x{h}+: {n:3}  ({n / len(d) * 100:.0f}%)")
+    xs = sorted(v["x"] for v in d)
+    print(f"  máximo x{xs[-1]:.1f} | mediana x{xs[len(xs) // 2]:.1f}")
+
+
 # --- modos -----------------------------------------------------------------
 def escanear(wallets, estado):
-    en_rango = {m: p for m, p in pares(candidatos(2)).items()
-                if F["mcap_min"] <= (p.get("marketCap") or p.get("fdv") or 0) <= F["mcap_max"]
-                and liq(p) >= F["liq_min"]}
-    print(f"[{time.strftime('%H:%M:%S')}] {len(en_rango)} tokens en rango "
-          f"${F['mcap_min'] / 1000:.0f}k-${F['mcap_max'] / 1e6:.0f}M", flush=True)
+    dentro = {m: p for m, p in pares(candidatos(2)).items() if en_rango(p)}
+    nuevas = sum(1 for p in dentro.values() if 0 < edad_h(p) <= F["edad_nueva_h"])
+    print(f"[{time.strftime('%H:%M:%S')}] {len(dentro)} tokens en rango "
+          f"${F['mcap_min'] / 1000:.0f}k-${F['mcap_max'] / 1e6:.0f}M "
+          f"({nuevas} recién salidas desde ${F['mcap_min_nueva'] / 1000:.0f}k)", flush=True)
 
-    for mint, par in en_rango.items():
+    for mint, par in dentro.items():
         rep = reporte(mint)
         if not rep:
             continue
         smart = smart_dentro(rep, wallets)
-        if len(smart) < F["min_smart"] or len(smart) <= estado.get(mint, 0):
+        if len(smart) < F["min_smart"] or len(smart) <= n_de(estado, mint):
             continue  # sin señal, o ya avisé con esta cantidad
         mal = anti_rug(rep, par)
         if mal:
             print(f"  x {par['baseToken']['symbol']}: {len(smart)} smart pero {', '.join(mal[:3])}")
             continue
-        estado[mint] = len(smart)
+        prev = estado.get(mint)
+        if isinstance(prev, dict):
+            prev["n"] = len(smart)          # 2da alerta del mismo token: el mcap de entrada es el primero
+        else:
+            estado[mint] = {"n": len(smart), "x": 1.0, "hito": 1, "t": time.time(),
+                            "mcap0": par.get("marketCap") or par.get("fdv") or 0,
+                            "sym": par["baseToken"]["symbol"], "url": par["url"],
+                            "nueva": 0 < edad_h(par) <= F["edad_nueva_h"]}
         msg = resumen(rep, par, smart)
         print("\n" + "=" * 60 + "\n" + msg + "\n" + "=" * 60 + "\n", flush=True)
         telegram(msg)
         ESTADO.write_text(json.dumps(estado))
+    seguir(estado)
     ESTADO.write_text(json.dumps(estado))
 
 
@@ -574,9 +642,30 @@ def test():
     assert len(sel) == F["top_n"] + 1, f"top_n no se respeta: {len(sel)}"
     assert "R49" in sel and "R0" not in sel, "no ordena por PnL"
     assert "FLOJA" not in sel, "entra una sin PnL ni aciertos"
+    nueva = {**par, "marketCap": 45_000, "pairCreatedAt": (time.time() - 3 * 3600) * 1000}
+    assert en_rango(nueva), "una recién salida de $45k queda afuera"
+    assert not en_rango({**nueva, "pairCreatedAt": (time.time() - 90 * 3600) * 1000}), \
+        "$45k con 90h de edad no es recién salida, es un token muerto"
+    assert not en_rango({**nueva, "marketCap": 20_000}), "acepta por debajo del piso de nuevas"
+    assert not en_rango({**nueva, "liquidity": {"usd": 500}}), "acepta sin liquidez"
+    assert not en_rango({**par, "marketCap": 9_000_000}), "acepta arriba del techo"
+    assert en_rango(par) and edad_h({}) == 0
     assert liq({"liquidity": None}) == 0 and liq({"liquidity": {"usd": 5}}) == 5
     assert bundle({"a", "b", "c"}, {"M1": ["a", "b", "z"]}) == "M1", "bundle no detectado"
     assert bundle({"a", "b", "c", "d"}, {"M1": ["a", "q"]}) is None, "falso bundle"
+    # seguimiento: hitos una sola vez, y el máximo no baja
+    assert n_de({"M": 3}, "M") == 3 and n_de({"M": {"n": 4}}, "M") == 4 and n_de({}, "M") == 0
+    v = {"mcap0": 500_000, "x": 1.0, "hito": 1, "t": time.time(), "n": 3}
+    v["x"], h = avanzar(v, 1_200_000)
+    assert (v["x"], h) == (2.4, 2), (v["x"], h)
+    v["hito"] = h
+    v["x"], h = avanzar(v, 900_000)
+    assert (v["x"], h) == (2.4, None), "el máximo bajó con el precio"
+    v["x"], h = avanzar(v, 6_000_000)
+    assert (v["x"], h) == (12.0, 10), "se saltea hitos en un salto grande"   # 5 y 10 juntos: avisa el mayor
+    v["hito"] = h
+    assert avanzar(v, 6_100_000)[1] is None, "reavisa un hito ya avisado"
+    assert avanzar({"mcap0": 0, "x": 1.0, "hito": 1}, 9e6) == (1.0, None), "divide por mcap 0"
     resumen(rep, par, s)
     print("ok")
 
@@ -597,6 +686,8 @@ if __name__ == "__main__":
         exportar()
     elif "--wallets" in a:
         listar()
+    elif "--stats" in a:
+        stats()
     else:
         sembrar()
         wallets, mias = vigiladas()
