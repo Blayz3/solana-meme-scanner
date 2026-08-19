@@ -140,3 +140,7 @@ nohup python3 scanner.py >> scanner.log 2>&1 &
 Corre el scanner en tu máquina y muestra en el navegador lo alertado: mcap de
 entrada, mcap de ahora, múltiplo alcanzado y a qué mcap está el x10. El log del
 bot va abajo. Necesita `smart.json` local (el de Actions vive en el secret).
+
+Arriba, lo alertado. Abajo, lo que el bot está mirando en el ciclo: tokens con
+smart money adentro pero todavía sin gatillo, con su riesgo al lado — el anti-rug
+está **apagado** (`F["anti_rug"] = False`), así que filtra nada y solo avisa.

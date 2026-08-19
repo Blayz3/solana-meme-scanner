@@ -18,6 +18,7 @@ from pathlib import Path
 
 DIR = Path(__file__).parent
 ESTADO = DIR / "estado.json"
+ULTIMO = DIR / "ultimo.json"
 PUERTO = 7777
 LOG = deque(maxlen=400)
 
@@ -32,9 +33,20 @@ def correr():
     LOG.append(f"--- el scanner terminó (código {bot.wait()}) ---")
 
 
+def leer(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default   # el scanner puede estar escribiéndolo justo ahora
+
+
+def ultimo():
+    return leer(ULTIMO, {"cerca": [], "simbolos": [], "en_rango": 0, "nuevas": 0, "gatillo": 3, "t": 0})
+
+
 def tokens():
     """Lo alertado, lo último arriba. El estado viejo (int pelado) no tiene nada que mostrar."""
-    d = json.loads(ESTADO.read_text() or "{}") if ESTADO.exists() else {}
+    d = leer(ESTADO, {})
     return sorted((dict(v, mint=m) for m, v in d.items() if isinstance(v, dict)),
                   key=lambda v: -v["t"])
 
@@ -54,14 +66,22 @@ HTML = """<!doctype html><meta charset=utf-8><title>solana meme scanner</title>
  .x{font-weight:700} .g0{color:var(--gris)} .g2{color:#6cb6ff} .g5{color:#f0b429} .g10{color:var(--lima)}
  .sym{font-weight:700} .nueva{color:var(--lima);font-size:11px;margin-left:6px}
  .vacio{color:var(--gris);padding:24px 10px}
+ .riesgo{color:#f0743e;font-size:11px;white-space:normal}
+ .escaneado{margin-top:10px;font-size:11px;color:#4d5560;white-space:normal;line-height:1.7}
+ h2{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--gris);
+   margin:0 0 10px;font-weight:400} h2 small{text-transform:none;letter-spacing:0}
  pre{background:var(--panel);border:1px solid var(--linea);border-radius:6px;padding:14px;
    margin:0;max-height:34vh;overflow:auto;color:var(--gris);font-size:12px;white-space:pre-wrap}
 </style>
 <header><h1>Solana meme scanner</h1><span id=estado>conectando…</span></header>
 <main>
+ <section><h2>Alertadas — comprar</h2>
  <table><thead><tr><th>Moneda<th class=num>Entrada<th class=num>Ahora<th class=num>Múltiplo
    <th class=num>Objetivo x10<th class=num>Wallets<th>Alertada<th></tr></thead>
-  <tbody id=filas></tbody></table>
+  <tbody id=filas></tbody></table></section>
+ <section><h2>En observación <small id=sub></small></h2>
+  <table><thead><tr><th>Moneda<th class=num>Mcap<th class=num>Smart wallets<th>Riesgo<th></tr></thead>
+   <tbody id=cerca></tbody></table></section>
  <pre id=log></pre>
 </main>
 <script>
@@ -83,6 +103,19 @@ async function refrescar() {
     <td class=g0>${hace(t.t)}
     <td>${t.url ? `<a href="${t.url}" target=_blank>dexscreener ↗</a>` : ''}</tr>`).join('')
     || '<tr><td colspan=8 class=vacio>Todavía ninguna. El bot avisa acá y por Telegram.</td></tr>';
+  const u = d.ultimo;
+  sub.textContent = u.t ? `— ${u.en_rango} tokens en rango (${u.nuevas} recién salidas) · gatillo ${u.gatillo} wallets`
+                          + (u.anti_rug === false ? ' · anti-rug APAGADO' : '')
+                        : '— esperando el primer ciclo…';
+  cerca.innerHTML = u.cerca.map(t => `<tr>
+    <td><span class=sym>${t.sym}</span>${t.nueva ? '<span class=nueva>NUEVA</span>' : ''}
+    <td class=num>${usd(t.mcap)}<td class="num ${t.n >= u.gatillo ? 'g10' : 'g0'}">${t.n} de ${u.gatillo}
+    <td>${(t.riesgo || []).length ? `<span class=riesgo>⚠️ ${t.riesgo.join(', ')}</span>` : ''}
+    <td><a href="${t.url}" target=_blank>dexscreener ↗</a></tr>`).join('')
+    || `<tr><td colspan=5 class=vacio>Ninguno de los ${u.en_rango} tokens del ciclo tiene smart money
+         adentro — es lo normal, el gatillo salta pocas veces por día.
+         <div class=escaneado>Escaneados sin señal (no son recomendaciones): ${(u.simbolos || []).join(' · ')}</div>
+       </td></tr>`;
   log.textContent = d.log.join('\\n');
   log.scrollTop = log.scrollHeight;
 }
@@ -93,7 +126,7 @@ refrescar(); setInterval(refrescar, 3000);
 class Panel(BaseHTTPRequestHandler):
     def do_GET(self):
         json_ = self.path.startswith("/datos")
-        cuerpo = json.dumps({"log": list(LOG), "tokens": tokens()}) if json_ else HTML
+        cuerpo = json.dumps({"log": list(LOG), "tokens": tokens(), "ultimo": ultimo()}) if json_ else HTML
         self.send_response(200)
         self.send_header("Content-Type", "application/json" if json_ else "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

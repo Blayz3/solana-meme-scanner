@@ -13,20 +13,20 @@
 Datos: DexScreener (precio/liq/vol) + RugCheck (holders, insiders, authorities, LP).
 Alertas a Telegram si exportás TELEGRAM_TOKEN y TELEGRAM_CHAT_ID.
 """
-import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+import json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 F = dict(
     # rango de compra
-    mcap_min=120_000, mcap_max=5_000_000,
-    mcap_min_nueva=30_000,  # recién salidas: piso más bajo, el x10 está acá
-    edad_nueva_h=24,        # hasta qué edad un par cuenta como "recién salido"
+    mcap_min=40_000, mcap_max=5_000_000,
+    edad_nueva_h=24,        # hasta qué edad un par se marca como "recién salido"
     liq_min=15_000,
     # gatillo de alerta
-    min_smart=3,          # smart wallets dentro del top 20 de holders
+    min_smart=2,          # smart wallets dentro del top 20 de holders
     top_n=30,             # cuántos traders vigilar (los tuyos van aparte, siempre)
     min_wins=3,           # una wallet es "smart" si acertó en >=3 tokens ganadores
-    # anti-rug (todo esto tiene que dar OK o se descarta)
+    # anti-rug: en False no descarta nada, solo avisa en la alerta (decisión de Ed)
+    anti_rug=False,
     holder_max_pct=15,    # holder individual (sin contar AMM/locker/lockers)
     top10_max_pct=45,     # concentración del top 10
     insider_max_pct=20,   # suma de holders marcados insider por RugCheck
@@ -54,7 +54,8 @@ VENTANA = 21 * 86400        # después de esto se deja de seguir el token
 
 DIR = Path(__file__).parent
 SMART = DIR / "smart.json"      # {"wallets": {addr: {"wins": n, "tokens": []}}, "creditados": []}
-ESTADO = DIR / "estado.json"    # {mint: ultimo_n_smart_alertado}
+ESTADO = DIR / "estado.json"    # {mint: {n, mcap0, x, hito, t, sym, url}}
+ULTIMO = DIR / "ultimo.json"    # foto del último ciclo, para el panel
 UA = {"User-Agent": "Mozilla/5.0 (meme-scanner)"}
 
 
@@ -135,11 +136,9 @@ def edad_h(par):
 
 
 def en_rango(par):
-    """Rango de compra. Las de <24h entran desde $30k: un x10 desde $2M pide $20M,
-    desde $50k pide $500k. Abajo el x10 es frecuente, por eso el anti-rug es el mismo."""
+    """Rango de compra: un x10 desde $2M pide $20M, desde $50k pide $500k. Por eso el piso bajo."""
     mcap = par.get("marketCap") or par.get("fdv") or 0
-    piso = F["mcap_min_nueva"] if 0 < edad_h(par) <= F["edad_nueva_h"] else F["mcap_min"]
-    return piso <= mcap <= F["mcap_max"] and liq(par) >= F["liq_min"]
+    return F["mcap_min"] <= mcap <= F["mcap_max"] and liq(par) >= F["liq_min"]
 
 
 def liq(par):
@@ -393,7 +392,7 @@ def smart_dentro(rep, wallets):
     return sorted(dentro, key=lambda x: -x[2])   # el de mayor múltiplo primero
 
 
-def resumen(rep, par, smart):
+def resumen(rep, par, smart, mal=()):
     hs = holders_reales(rep)
     ins = [h for h in rep.get("topHolders") or [] if h.get("insider")]
     vol24 = (par.get("volume") or {}).get("h24") or 0
@@ -411,6 +410,8 @@ def resumen(rep, par, smart):
     ]
     lineas += [f"  {w[:4]}..{w[-4:]}  {pct:.2f}% del supply" + (f"  (max {roi / 100:.0f}x)" if roi else "  (tuya)")
                for w, pct, roi in smart[:6]]
+    if mal:
+        lineas += [f"⚠️ riesgo (el filtro está apagado): {', '.join(mal)}"]
     lineas += [par["url"], rep["mint"]]
     return "\n".join(lineas)
 
@@ -473,17 +474,24 @@ def escanear(wallets, estado):
     nuevas = sum(1 for p in dentro.values() if 0 < edad_h(p) <= F["edad_nueva_h"])
     print(f"[{time.strftime('%H:%M:%S')}] {len(dentro)} tokens en rango "
           f"${F['mcap_min'] / 1000:.0f}k-${F['mcap_max'] / 1e6:.0f}M "
-          f"({nuevas} recién salidas desde ${F['mcap_min_nueva'] / 1000:.0f}k)", flush=True)
+          f"({nuevas} recién salidas) | gatillo >={F['min_smart']} wallets"
+          f"{'' if F['anti_rug'] else ' | anti-rug APAGADO'}", flush=True)
 
+    mirando = []
     for mint, par in dentro.items():
         rep = reporte(mint)
         if not rep:
             continue
         smart = smart_dentro(rep, wallets)
+        if smart:  # 1 o 2 wallets no gatillan, pero es lo que el bot está vigilando
+            mirando.append({"mint": mint, "sym": par["baseToken"]["symbol"], "n": len(smart),
+                            "mcap": par.get("marketCap") or par.get("fdv") or 0, "url": par["url"],
+                            "nueva": 0 < edad_h(par) <= F["edad_nueva_h"],
+                            "riesgo": anti_rug(rep, par)})
         if len(smart) < F["min_smart"] or len(smart) <= n_de(estado, mint):
             continue  # sin señal, o ya avisé con esta cantidad
         mal = anti_rug(rep, par)
-        if mal:
+        if mal and F["anti_rug"]:
             print(f"  x {par['baseToken']['symbol']}: {len(smart)} smart pero {', '.join(mal[:3])}")
             continue
         prev = estado.get(mint)
@@ -494,12 +502,18 @@ def escanear(wallets, estado):
                             "mcap0": par.get("marketCap") or par.get("fdv") or 0,
                             "sym": par["baseToken"]["symbol"], "url": par["url"],
                             "nueva": 0 < edad_h(par) <= F["edad_nueva_h"]}
-        msg = resumen(rep, par, smart)
+        msg = resumen(rep, par, smart, mal)
         print("\n" + "=" * 60 + "\n" + msg + "\n" + "=" * 60 + "\n", flush=True)
         telegram(msg)
         ESTADO.write_text(json.dumps(estado))
     seguir(estado)
     ESTADO.write_text(json.dumps(estado))
+    ULTIMO.write_text(json.dumps({
+        "t": time.time(), "en_rango": len(dentro), "nuevas": nuevas, "gatillo": F["min_smart"],
+        "anti_rug": F["anti_rug"],
+        "cerca": sorted(mirando, key=lambda v: -v["n"])[:20],
+        # lo escaneado sin señal: no son recomendaciones, es para ver que el bot está vivo
+        "simbolos": [p["baseToken"]["symbol"] for p in dentro.values()][:40]}))
 
 
 def bootstrap():
@@ -642,14 +656,17 @@ def test():
     assert len(sel) == F["top_n"] + 1, f"top_n no se respeta: {len(sel)}"
     assert "R49" in sel and "R0" not in sel, "no ordena por PnL"
     assert "FLOJA" not in sel, "entra una sin PnL ni aciertos"
-    nueva = {**par, "marketCap": 45_000, "pairCreatedAt": (time.time() - 3 * 3600) * 1000}
-    assert en_rango(nueva), "una recién salida de $45k queda afuera"
-    assert not en_rango({**nueva, "pairCreatedAt": (time.time() - 90 * 3600) * 1000}), \
-        "$45k con 90h de edad no es recién salida, es un token muerto"
-    assert not en_rango({**nueva, "marketCap": 20_000}), "acepta por debajo del piso de nuevas"
-    assert not en_rango({**nueva, "liquidity": {"usd": 500}}), "acepta sin liquidez"
+    chica = {**par, "marketCap": 45_000, "pairCreatedAt": (time.time() - 3 * 3600) * 1000}
+    assert en_rango(chica), "una de $45k queda afuera"
+    assert not en_rango({**chica, "marketCap": 30_000}), "acepta por debajo del piso"
+    assert not en_rango({**chica, "liquidity": {"usd": 500}}), "acepta sin liquidez"
     assert not en_rango({**par, "marketCap": 9_000_000}), "acepta arriba del techo"
     assert en_rango(par) and edad_h({}) == 0
+    # el filtro apagado no descarta, pero el riesgo tiene que llegar a la alerta
+    libre = {**rep, "markets": [{"lp": {"lpLockedPct": 0}}]}
+    assert not F["anti_rug"] and anti_rug(libre, par), "anti_rug quedó prendido"
+    assert "LP libre" in resumen(libre, par, s, anti_rug(libre, par)), "la alerta no muestra el riesgo"
+    assert "⚠️" not in resumen(rep, par, s), "avisa riesgo donde no hay"
     assert liq({"liquidity": None}) == 0 and liq({"liquidity": {"usd": 5}}) == 5
     assert bundle({"a", "b", "c"}, {"M1": ["a", "b", "z"]}) == "M1", "bundle no detectado"
     assert bundle({"a", "b", "c", "d"}, {"M1": ["a", "q"]}) is None, "falso bundle"
@@ -666,6 +683,10 @@ def test():
     v["hito"] = h
     assert avanzar(v, 6_100_000)[1] is None, "reavisa un hito ya avisado"
     assert avanzar({"mcap0": 0, "x": 1.0, "hito": 1}, 9e6) == (1.0, None), "divide por mcap 0"
+    # toda clave de F que se use tiene que existir: borrar una y dejar el uso vivo revienta
+    # recién en producción, donde escanear() no llega a los asserts (así pasó con mcap_min_nueva)
+    faltan = {k for k in re.findall(r'F\["(\w+)"\]', Path(__file__).read_text())} - set(F)
+    assert not faltan, f"config inexistente: {faltan}"
     resumen(rep, par, s)
     print("ok")
 
