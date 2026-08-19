@@ -132,3 +132,11 @@ nohup python3 scanner.py >> scanner.log 2>&1 &
   el ranking cada par de meses con `--rank`.
 - **Cada 20 min, no al instante**: si tres de ellos entran justo después de una corrida,
   te enterás hasta 20 minutos después.
+
+## Panel local
+
+    python3 app.py     # http://localhost:7777
+
+Corre el scanner en tu máquina y muestra en el navegador lo alertado: mcap de
+entrada, mcap de ahora, múltiplo alcanzado y a qué mcap está el x10. El log del
+bot va abajo. Necesita `smart.json` local (el de Actions vive en el secret).
